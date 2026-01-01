@@ -16,7 +16,7 @@ from typing import Optional, Literal, Generator
 # Adjust path to include CosyVoice modules
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(ROOT_DIR)
-sys.path.append(os.path.join(ROOT_DIR, 'third_party', 'Matcha-TTS'))
+sys.path.append(os.path.join(ROOT_DIR, "third_party", "Matcha-TTS"))
 
 try:
     from cosyvoice.cli.cosyvoice import AutoModel
@@ -42,18 +42,20 @@ cosyvoice = None
 MODEL_DIR = "pretrained_models/Fun-CosyVoice3-0.5B"
 DEFAULT_PROMPT_WAV = "asset/zero_shot_prompt.wav"
 
-DEFAULT_PROMPT_TEXT = "希望你以后能够做的比我还好呦。"
+DEFAULT_PROMPT_TEXT = (
+    "You are a helpful assistant.<|endofprompt|>希望你以后能够做的比我还好呦。"
+)
 
 # CUSTOM VOICE MAP
 VOICE_MAP = {
     "russian": {
         "text": "Всем привет, дорогие друзья! Сейчас 6.20 и мы с вами успели. Сегодня мы с вами встречаем восход солнца.",
-        "wav": "asset/russian_prompt.wav"
+        "wav": "asset/russian_prompt.wav",
     },
     "english": {
         "text": "And then later on, fully acquiring that company. So keeping management in line, interest in line with the asset that's coming into the family is a reason why sometimes we don't buy the whole thing.",
-        "wav": "asset/cross_lingual_prompt.wav"
-    }
+        "wav": "asset/cross_lingual_prompt.wav",
+    },
 }
 
 
@@ -61,24 +63,28 @@ class SpeechRequest(BaseModel):
     model: Optional[str] = "tts-1"
     input: str
     voice: Optional[str] = "中文女"
-    response_format: Optional[Literal['mp3', 'opus', 'aac', 'flac', 'wav', 'pcm']] = "mp3"
+    response_format: Optional[Literal["mp3", "opus", "aac", "flac", "wav", "pcm"]] = (
+        "mp3"
+    )
     speed: Optional[float] = 1.0
 
+
 def get_ffmpeg_cmd(format: str, sample_rate: int):
-    cmd = ['ffmpeg', '-f', 's16le', '-ar', str(sample_rate), '-ac', '1', '-i', 'pipe:0']
-    if format == 'mp3':
-        cmd.extend(['-f', 'mp3', 'pipe:1'])
-    elif format == 'opus':
-        cmd.extend(['-f', 'opus', '-c:a', 'libopus', 'pipe:1'])
-    elif format == 'aac':
-        cmd.extend(['-f', 'adts', 'pipe:1'])
-    elif format == 'flac':
-        cmd.extend(['-f', 'flac', 'pipe:1'])
-    elif format == 'wav':
-        cmd.extend(['-f', 'wav', 'pipe:1'])
+    cmd = ["ffmpeg", "-f", "s16le", "-ar", str(sample_rate), "-ac", "1", "-i", "pipe:0"]
+    if format == "mp3":
+        cmd.extend(["-f", "mp3", "pipe:1"])
+    elif format == "opus":
+        cmd.extend(["-f", "opus", "-c:a", "libopus", "pipe:1"])
+    elif format == "aac":
+        cmd.extend(["-f", "adts", "pipe:1"])
+    elif format == "flac":
+        cmd.extend(["-f", "flac", "pipe:1"])
+    elif format == "wav":
+        cmd.extend(["-f", "wav", "pipe:1"])
     else:
         raise ValueError(f"Unsupported format via ffmpeg: {format}")
     return cmd
+
 
 @app.on_event("startup")
 async def startup_event():
@@ -86,34 +92,87 @@ async def startup_event():
     logger.info(f"Loading model from {MODEL_DIR}...")
     try:
         if not os.path.exists(MODEL_DIR):
-            logger.warning(f"Model directory {MODEL_DIR} not found. Please run download_models.py first.")
+            logger.warning(
+                f"Model directory {MODEL_DIR} not found. Please run download_models.py first."
+            )
         else:
-            cosyvoice = AutoModel(model_dir=MODEL_DIR)
+            if "CosyVoice2" in MODEL_DIR:
+                cosyvoice = AutoModel(
+                    model_dir=MODEL_DIR, load_trt=True, load_jit=True, fp16=True
+                )
+            else:
+                cosyvoice = AutoModel(model_dir=MODEL_DIR, load_trt=True)
             logger.info(f"Model loaded. Sample rate: {cosyvoice.sample_rate}")
             available_spks = cosyvoice.list_available_spks()
             logger.info(f"Available speakers: {available_spks}")
+
+            # Warmup: run a short inference to initialize all internal states
+            await warmup_model()
     except Exception as e:
         logger.error(f"Failed to load model: {e}")
 
+
+async def warmup_model():
+    """Run a short inference to warmup the model and reduce first-request latency."""
+    if not cosyvoice:
+        return
+
+    logger.info("Starting model warmup...")
+    # Use a longer warmup text to avoid "text too short" warning in zero-shot mode
+
+    def text_generator():
+        yield "收到好"
+        yield "友从远方"
+        yield "寄来的生日礼物，"
+        yield "那份意外"
+        yield "的惊喜与深"
+        yield "深的祝福"
+        yield "让我心中充满"
+        yield "了甜蜜的快乐，"
+        yield "笑容如花儿般"
+        yield "绽放。"
+
+    try:
+        loop = asyncio.get_running_loop()
+
+        def run_warmup():
+            # Use zero-shot mode with default prompt
+            logger.info("Warmup using zero-shot mode")
+            for _ in cosyvoice.inference_zero_shot(
+                text_generator(), DEFAULT_PROMPT_TEXT, DEFAULT_PROMPT_WAV, stream=True
+            ):
+                pass  # Consume the generator
+
+        await loop.run_in_executor(None, run_warmup)
+        logger.info("Model warmup completed successfully")
+    except Exception as e:
+        logger.warning(f"Model warmup failed (non-critical): {e}")
+
+
 @app.get("/v1/models")
 async def list_models():
-    return JSONResponse(content={
-        "object": "list",
-        "data": [
-            {
-                "id": "cosyvoice-tts",
-                "object": "model",
-                "created": 1234567890,
-                "owned_by": "cosyvoice",
-            }
-        ]
-    })
+    return JSONResponse(
+        content={
+            "object": "list",
+            "data": [
+                {
+                    "id": "cosyvoice-tts",
+                    "object": "model",
+                    "created": 1234567890,
+                    "owned_by": "cosyvoice",
+                }
+            ],
+        }
+    )
+
 
 @app.post("/v1/audio/speech")
 async def text_to_speech(req: SpeechRequest):
     if not cosyvoice:
-        raise HTTPException(status_code=500, detail="Model not loaded or invalid model directory.")
-    
+        raise HTTPException(
+            status_code=500, detail="Model not loaded or invalid model directory."
+        )
+
     text = req.input
     spk_id = req.voice
     speed = req.speed if req.speed else 1.0
@@ -121,7 +180,7 @@ async def text_to_speech(req: SpeechRequest):
     # Custom Voice Logic
     prompt_text = DEFAULT_PROMPT_TEXT
     prompt_wav = DEFAULT_PROMPT_WAV
-    
+
     # Check if requested voice matches our map (case-insensitive)
     for key, val in VOICE_MAP.items():
         if key.lower() in spk_id.lower():
@@ -130,23 +189,28 @@ async def text_to_speech(req: SpeechRequest):
             logger.info(f"Using custom prompt for voice '{spk_id}': {val['wav']}")
             break
     format = req.response_format
-    
+
     available_spks = cosyvoice.list_available_spks()
     use_zero_shot = spk_id not in available_spks
 
-    logger.info(f"TTS Request: text='{text[:20]}...', voice='{spk_id}', format={format}, speed={speed}, zero_shot={use_zero_shot}")
+    logger.info(
+        f"TTS Request: text='{text[:20]}...', voice='{spk_id}', format={format}, speed={speed}, zero_shot={use_zero_shot}"
+    )
 
     async def audio_generator():
         loop = asyncio.get_running_loop()
         queue = asyncio.Queue()
         sentinel = object()
         ffmpeg_proc = None
-        
-        if format != 'pcm':
+
+        if format != "pcm":
             try:
                 cmd = get_ffmpeg_cmd(format, cosyvoice.sample_rate)
                 ffmpeg_proc = subprocess.Popen(
-                    cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
                 )
             except Exception as e:
                 logger.error(f"ffmpeg error: {e}")
@@ -155,12 +219,18 @@ async def text_to_speech(req: SpeechRequest):
         def producer_thread():
             try:
                 if use_zero_shot:
-                    generator = cosyvoice.inference_zero_shot(text, prompt_text, prompt_wav, stream=True, speed=speed)
+                    generator = cosyvoice.inference_zero_shot(
+                        text, prompt_text, prompt_wav, stream=True, speed=speed
+                    )
                 else:
-                    generator = cosyvoice.inference_sft(text, spk_id, stream=True, speed=speed)
+                    generator = cosyvoice.inference_sft(
+                        text, spk_id, stream=True, speed=speed
+                    )
 
                 for i in generator:
-                    raw_data = (i['tts_speech'].numpy() * (2 ** 15)).astype(np.int16).tobytes()
+                    raw_data = (
+                        (i["tts_speech"].numpy() * (2**15)).astype(np.int16).tobytes()
+                    )
                     if ffmpeg_proc:
                         try:
                             ffmpeg_proc.stdin.write(raw_data)
@@ -169,7 +239,7 @@ async def text_to_speech(req: SpeechRequest):
                             break
                     else:
                         loop.call_soon_threadsafe(queue.put_nowait, raw_data)
-                
+
                 if ffmpeg_proc:
                     ffmpeg_proc.stdin.close()
                 else:
@@ -181,11 +251,13 @@ async def text_to_speech(req: SpeechRequest):
                 loop.call_soon_threadsafe(queue.put_nowait, sentinel)
 
         def reader_thread():
-            if not ffmpeg_proc: return
+            if not ffmpeg_proc:
+                return
             try:
                 while True:
                     chunk = ffmpeg_proc.stdout.read(4096)
-                    if not chunk: break
+                    if not chunk:
+                        break
                     loop.call_soon_threadsafe(queue.put_nowait, chunk)
                 ffmpeg_proc.wait()
             except Exception as e:
@@ -196,24 +268,29 @@ async def text_to_speech(req: SpeechRequest):
         threading.Thread(target=producer_thread, daemon=True).start()
         if ffmpeg_proc:
             threading.Thread(target=reader_thread, daemon=True).start()
-            
+
         while True:
             chunk = await queue.get()
-            if chunk is sentinel: break
+            if chunk is sentinel:
+                break
             yield chunk
 
     media_type = f"audio/{format}"
-    if format == 'pcm': media_type = "application/octet-stream"
-    elif format == 'mp3': media_type = "audio/mpeg"
-    elif format == 'wav': media_type = "audio/wav"
-    
+    if format == "pcm":
+        media_type = "application/octet-stream"
+    elif format == "mp3":
+        media_type = "audio/mpeg"
+    elif format == "wav":
+        media_type = "audio/wav"
+
     return StreamingResponse(audio_generator(), media_type=media_type)
+
 
 @app.websocket("/v1/audio/speech/stream")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info("WebSocket connection established")
-    
+
     try:
         # 1. Receive config
         config_msg = await websocket.receive_text()
@@ -222,13 +299,13 @@ async def websocket_endpoint(websocket: WebSocket):
         speed = config.get("speed", 1.0)
         language = config.get("language")
         # format = config.get("response_format", "pcm") # For simplicity, WS yields PCM for now
-        
+
         available_spks = cosyvoice.list_available_spks()
         use_zero_shot = spk_id not in available_spks
-        
+
         # 2. Setup text generator for bi-streaming
         text_queue = asyncio.Queue()
-        
+
         def sync_text_generator():
             # This generator will be consumed by CosyVoice in a background thread
             first_chunk = True
@@ -238,18 +315,18 @@ async def websocket_endpoint(websocket: WebSocket):
                 val = future.result()
                 if val is None:
                     break
-                
+
                 # Prepend language tag if provided in config
                 if first_chunk and language:
                     val = f"<|{language}|>" + val
                     first_chunk = False
                 elif first_chunk:
                     first_chunk = False
-                    
+
                 yield val
 
         loop = asyncio.get_running_loop()
-        
+
         # 3. Start inference in a separate thread
         inference_finished_event = asyncio.Event()
 
@@ -259,16 +336,31 @@ async def websocket_endpoint(websocket: WebSocket):
                 if use_zero_shot:
                     # Note: inference_zero_shot with generator is only supported if the model is CosyVoice2/3
                     # and it calls inference_bistream internally.
-                    gen = cosyvoice.inference_zero_shot(sync_text_generator(), DEFAULT_PROMPT_TEXT, DEFAULT_PROMPT_WAV, stream=True, speed=speed)
+                    gen = cosyvoice.inference_zero_shot(
+                        sync_text_generator(),
+                        DEFAULT_PROMPT_TEXT,
+                        DEFAULT_PROMPT_WAV,
+                        stream=True,
+                        speed=speed,
+                    )
                 else:
-                    gen = cosyvoice.inference_sft(sync_text_generator(), spk_id, stream=True, speed=speed)
-                
+                    gen = cosyvoice.inference_sft(
+                        sync_text_generator(), spk_id, stream=True, speed=speed
+                    )
+
                 for output in gen:
-                    audio_data = (output['tts_speech'].numpy() * (2 ** 15)).astype(np.int16).tobytes()
-                    asyncio.run_coroutine_threadsafe(websocket.send_bytes(audio_data), loop)
+                    audio_data = (
+                        (output["tts_speech"].numpy() * (2**15))
+                        .astype(np.int16)
+                        .tobytes()
+                    )
+                    asyncio.run_coroutine_threadsafe(
+                        websocket.send_bytes(audio_data), loop
+                    )
             except Exception as e:
                 logger.error(f"WS Inference error: {e}")
                 import traceback
+
                 logger.error(traceback.format_exc())
             finally:
                 loop.call_soon_threadsafe(inference_finished_event.set)
@@ -284,13 +376,13 @@ async def websocket_endpoint(websocket: WebSocket):
             if text_chunk:
                 await text_queue.put(text_chunk)
             if msg.get("event") == "flush":
-                # CosyVoice doesn't have an explicit flush per chunk, 
+                # CosyVoice doesn't have an explicit flush per chunk,
                 # but we can handle it if we want to restart the generator
                 pass
             if msg.get("event") == "end":
                 await text_queue.put(None)
                 break
-        
+
         # Wait for inference to finish sending all audio
         await inference_finished_event.wait()
 
@@ -306,13 +398,17 @@ async def websocket_endpoint(websocket: WebSocket):
         # Ensure thread stops
         await text_queue.put(None)
 
+
 if __name__ == "__main__":
     import uvicorn
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=50000)
     parser.add_argument("--host", type=str, default="0.0.0.0")
-    parser.add_argument("--model_dir", type=str, default="pretrained_models/Fun-CosyVoice3-0.5B")
+    parser.add_argument(
+        "--model_dir", type=str, default="pretrained_models/Fun-CosyVoice3-0.5B"
+    )
     args = parser.parse_args()
-    
+
     MODEL_DIR = args.model_dir
     uvicorn.run(app, host=args.host, port=args.port)
