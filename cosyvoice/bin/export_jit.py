@@ -24,9 +24,7 @@ ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append('{}/../..'.format(ROOT_DIR))
 sys.path.append('{}/../../third_party/Matcha-TTS'.format(ROOT_DIR))
 from cosyvoice.cli.cosyvoice import AutoModel
-from cosyvoice.cli.model import CosyVoiceModel, CosyVoice2Model, CosyVoice3Model
 from cosyvoice.utils.file_utils import logging
-from cosyvoice.utils.class_utils import get_model_type
 
 
 def get_args():
@@ -61,15 +59,7 @@ def main():
 
     model = AutoModel(model_dir=args.model_dir)
 
-    if get_model_type(model.model) == CosyVoiceModel:
-        # 1. export flow encoder
-        flow_encoder = model.model.flow.encoder
-        script = get_optimized_script(flow_encoder)
-        script.save('{}/flow.encoder.fp32.zip'.format(args.model_dir))
-        script = get_optimized_script(flow_encoder.half())
-        script.save('{}/flow.encoder.fp16.zip'.format(args.model_dir))
-        logging.info('successfully export flow_encoder')
-    elif get_model_type(model.model) == CosyVoice2Model:
+    if model.__class__.__name__ == 'CosyVoice':
         # 1. export llm text_encoder
         llm_text_encoder = model.model.llm.text_encoder
         script = get_optimized_script(llm_text_encoder)
@@ -87,6 +77,14 @@ def main():
         logging.info('successfully export llm_llm')
 
         # 3. export flow encoder
+        flow_encoder = model.model.flow.encoder
+        script = get_optimized_script(flow_encoder)
+        script.save('{}/flow.encoder.fp32.zip'.format(args.model_dir))
+        script = get_optimized_script(flow_encoder.half())
+        script.save('{}/flow.encoder.fp16.zip'.format(args.model_dir))
+        logging.info('successfully export flow_encoder')
+    elif model.__class__.__name__ == 'CosyVoice2':
+        # 1. export flow encoder
         flow_encoder = model.model.flow.encoder
         script = get_optimized_script(flow_encoder)
         script.save('{}/flow.encoder.fp32.zip'.format(args.model_dir))
