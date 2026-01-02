@@ -18,6 +18,7 @@ import torch
 import numpy as np
 import threading
 import time
+from cosyvoice.utils.file_utils import logging
 from torch.nn import functional as F
 from contextlib import nullcontext
 import uuid
@@ -156,10 +157,6 @@ class CosyVoiceModel:
             ),
         ):
             if isinstance(text, Generator):
-                assert self.__class__.__name__ != "CosyVoiceModel", (
-                    "streaming input text is only implemented for CosyVoice2/3!"
-                )
-                # Use VLLM-aware bistream if VLLM is loaded
                 if hasattr(self.llm, "vllm"):
                     token_generator = self.llm.inference_bistream_vllm(
                         text=text,
@@ -174,6 +171,9 @@ class CosyVoiceModel:
                         embedding=llm_embedding.to(self.device),
                     )
                 else:
+                    assert self.__class__.__name__ != "CosyVoiceModel", (
+                        "streaming input text is only implemented for CosyVoice2/3"
+                    )
                     token_generator = self.llm.inference_bistream(
                         text=text,
                         prompt_text=prompt_text.to(self.device),
@@ -212,8 +212,13 @@ class CosyVoiceModel:
                     cur_silent_token_num = 0
                 self.tts_speech_token_dict[uuid].append(i)
                 self.token_ready_event_dict[uuid].set()  # Signal that token is ready
+                if len(self.tts_speech_token_dict[uuid]) % 10 == 0:
+                    logging.info(
+                        f"LLM produced {len(self.tts_speech_token_dict[uuid])} tokens for {uuid}"
+                    )
         self.llm_end_dict[uuid] = True
         self.token_ready_event_dict[uuid].set()  # Signal completion
+        logging.info(f"LLM finished for {uuid}")
 
     def vc_job(self, source_speech_token, uuid):
         self.tts_speech_token_dict[uuid] = source_speech_token.flatten().tolist()
@@ -338,9 +343,17 @@ class CosyVoiceModel:
         if stream is True:
             token_hop_len = self.token_min_hop_len
             while True:
-                # Wait for token ready event with timeout
-                self.token_ready_event_dict[this_uuid].wait(timeout=0.1)
-                self.token_ready_event_dict[this_uuid].clear()
+                # Check if we have enough tokens to process
+                if (
+                    len(self.tts_speech_token_dict[this_uuid])
+                    < token_hop_len + self.token_overlap_len
+                ):
+                    if self.llm_end_dict[this_uuid] is True:
+                        break
+                    self.token_ready_event_dict[this_uuid].wait()
+                    self.token_ready_event_dict[this_uuid].clear()
+                    continue
+
                 if (
                     len(self.tts_speech_token_dict[this_uuid])
                     >= token_hop_len + self.token_overlap_len
@@ -462,10 +475,11 @@ class CosyVoice2Model(CosyVoiceModel):
             model=model_dir,
             skip_tokenizer_init=True,
             enable_prompt_embeds=True,
-            gpu_memory_utilization=0.25,
-            max_model_len=1536,
-            max_num_seqs=1536,
+            gpu_memory_utilization=0.2,
+            max_model_len=1280,
+            max_num_seqs=1280,
             enable_prefix_caching=True,
+            dtype="float16",
         )
         self.llm.vllm = LLMEngine.from_engine_args(engine_args)
         self.llm.lock = threading.Lock()
@@ -590,14 +604,22 @@ class CosyVoice2Model(CosyVoiceModel):
                 - flow_prompt_speech_token.shape[1]
             )
             while True:
-                # Wait for token ready event with timeout
-                self.token_ready_event_dict[this_uuid].wait(timeout=0.1)
-                self.token_ready_event_dict[this_uuid].clear()
                 this_token_hop_len = (
                     self.token_hop_len + prompt_token_pad
                     if token_offset == 0
                     else self.token_hop_len
                 )
+
+                # Check if we have enough tokens to process
+                if (
+                    len(self.tts_speech_token_dict[this_uuid]) - token_offset
+                    < this_token_hop_len + self.flow.pre_lookahead_len
+                ):
+                    if self.llm_end_dict[this_uuid] is True:
+                        break
+                    self.token_ready_event_dict[this_uuid].wait()
+                    self.token_ready_event_dict[this_uuid].clear()
+                    continue
                 if (
                     len(self.tts_speech_token_dict[this_uuid]) - token_offset
                     >= this_token_hop_len + self.flow.pre_lookahead_len
@@ -620,6 +642,7 @@ class CosyVoice2Model(CosyVoiceModel):
                         finalize=False,
                     )
                     token_offset += this_token_hop_len
+                    logging.info(f"Yielding audio chunk, offset {token_offset}")
                     yield {"tts_speech": this_tts_speech.cpu()}
                 if (
                     self.llm_end_dict[this_uuid] is True

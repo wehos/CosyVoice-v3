@@ -873,6 +873,500 @@ class Qwen2LM(TransformerLM):
             yield top_ids
             lm_input = self.speech_embedding.weight[top_ids].reshape(1, 1, -1)
 
+    @torch.inference_mode()
+    def inference_bistream_vllm(
+        self,
+        text: Generator,
+        prompt_text: torch.Tensor,
+        prompt_text_len: torch.Tensor,
+        prompt_speech_token: torch.Tensor,
+        prompt_speech_token_len: torch.Tensor,
+        embedding: torch.Tensor,
+        sampling: int = 25,
+        max_token_text_ratio: float = 20,
+        min_token_text_ratio: float = 2,
+    ) -> Generator[torch.Tensor, None, None]:
+        """vLLM-based bistream inference with prefix caching support for CosyVoice3.
+
+        This method submits independent requests to vLLM and collects incremental results.
+        It leverages vLLM's KV cache to accelerate inference when text is streamed in chunks.
+        """
+        from vllm import SamplingParams, RequestOutput
+        import uuid as uuid_lib
+
+        device = prompt_text.device
+
+        # Timing for first token (will be set when first vLLM request is submitted)
+        inference_start_time = None
+        first_token_logged = False
+
+        # Prepare embeddings for vllm (using speech_embedding for special tokens in CosyVoice3)
+        sos_emb = self.speech_embedding.weight[self.sos].reshape(1, 1, -1)
+        task_id_emb = self.speech_embedding.weight[self.task_id].reshape(1, 1, -1)
+        if prompt_speech_token_len != 0:
+            prompt_speech_token_emb = self.speech_embedding(prompt_speech_token)
+        else:
+            prompt_speech_token_emb = torch.zeros(
+                1, 0, self.llm_input_size, dtype=prompt_text.dtype
+            ).to(device)
+
+        # Initialize state
+        out_tokens = []
+        text_cache_emb = self.llm.model.model.embed_tokens(prompt_text)
+        next_fill_index = (
+            int(prompt_speech_token.shape[1] / self.mix_ratio[1]) + 1
+        ) * self.mix_ratio[1] - prompt_speech_token.shape[1]
+
+        # Build prefix embeds (will be reused via vLLM's prefix caching)
+        prefix_embeds = sos_emb.squeeze(0)  # [1, llm_input_size]
+        # current_request_id = 0 # Unused
+
+        for this_text in text:
+            # Accumulate text embeddings
+            this_text_emb = self.llm.model.model.embed_tokens(this_text)
+            text_cache_emb = torch.concat([text_cache_emb, this_text_emb], dim=1)
+
+            # Consume prompt speech tokens (interleaved text-speech mixing)
+            while prompt_speech_token_emb.size(1) != 0:
+                if text_cache_emb.size(1) >= self.mix_ratio[0]:
+                    text_chunk = text_cache_emb[:, : self.mix_ratio[0]]
+                    speech_chunk = prompt_speech_token_emb[:, : self.mix_ratio[1]]
+                    prefix_embeds = torch.concat(
+                        [prefix_embeds, text_chunk.squeeze(0), speech_chunk.squeeze(0)],
+                        dim=0,
+                    )
+                    text_cache_emb = text_cache_emb[:, self.mix_ratio[0] :]
+                    prompt_speech_token_emb = prompt_speech_token_emb[
+                        :, self.mix_ratio[1] :
+                    ]
+                else:
+                    break
+
+            # When all prompt speech tokens consumed, start generating
+            if prompt_speech_token_emb.size(1) == 0:
+                # Check if we need more text tokens
+                need_text = (
+                    len(out_tokens) != 0 and out_tokens[-1] == self.fill_token
+                ) or (len(out_tokens) == 0)
+
+                if need_text:
+                    if text_cache_emb.size(1) >= self.mix_ratio[0]:
+                        text_chunk = text_cache_emb[:, : self.mix_ratio[0]]
+                        prefix_embeds = torch.concat(
+                            [prefix_embeds, text_chunk.squeeze(0)], dim=0
+                        )
+                        text_cache_emb = text_cache_emb[:, self.mix_ratio[0] :]
+                    else:
+                        continue
+
+                # Submit vLLM request with current prefix
+                lm_input = prefix_embeds.unsqueeze(0)  # [1, seq_len, hidden_size]
+
+                # Add speech token embeddings for continuation if we have generated tokens
+                if len(out_tokens) > 0 and out_tokens[-1] != self.fill_token:
+                    last_speech_emb = self.speech_embedding.weight[
+                        out_tokens[-1]
+                    ].reshape(1, 1, -1)
+                    lm_input = torch.concat([lm_input, last_speech_emb], dim=1)
+
+                # Calculate how many tokens to generate until next fill
+                tokens_until_fill = (
+                    next_fill_index - len(out_tokens)
+                    if next_fill_index > len(out_tokens)
+                    else self.mix_ratio[1]
+                )
+
+                # Use vLLM with stop at fill_token position
+                sampling_params = SamplingParams(
+                    top_k=sampling,
+                    stop_token_ids=self.stop_token_ids,
+                    max_tokens=tokens_until_fill,
+                    detokenize=False,
+                )
+
+                request_id = str(uuid_lib.uuid4())
+
+                # Start timing just before submitting the first vLLM request
+                if inference_start_time is None:
+                    inference_start_time = time.time()
+
+                with self.lock:
+                    self.vllm.add_request(
+                        request_id,
+                        {"prompt_embeds": lm_input.squeeze(0).to(torch.bfloat16)},
+                        sampling_params,
+                    )
+                    self.vllm_output_queue[request_id] = queue.Queue()
+
+                # Collect tokens from this request
+                generated_count = 0
+                while True:
+                    with self.lock:
+                        if self.vllm_output_queue[request_id].empty():
+                            request_outputs: List[RequestOutput] = self.vllm.step()
+                            for request_output in request_outputs:
+                                if request_output.request_id in self.vllm_output_queue:
+                                    top_ids = list(request_output.outputs[0].token_ids)[
+                                        -1
+                                    ]
+                                    self.vllm_output_queue[
+                                        request_output.request_id
+                                    ].put((top_ids, request_output.finished))
+
+                    if not self.vllm_output_queue[request_id].empty():
+                        top_ids, finished = self.vllm_output_queue[request_id].get()
+
+                        if top_ids in self.stop_token_ids:
+                            break
+
+                        # Check for fill token position
+                        if len(out_tokens) == next_fill_index:
+                            out_tokens.append(self.fill_token)
+                            next_fill_index = len(out_tokens) + self.mix_ratio[1]
+                            break
+
+                        out_tokens.append(top_ids)
+                        generated_count += 1
+
+                        # Log timing for first token
+                        if not first_token_logged:
+                            first_token_time = (
+                                time.time() - inference_start_time
+                            ) * 1000
+                            logging.info(f"vllm: first_token={first_token_time:.1f}ms")
+                            first_token_logged = True
+
+                        # Update prefix_embeds for next iteration
+                        token_emb = self.speech_embedding.weight[top_ids].reshape(1, -1)
+                        prefix_embeds = torch.concat([prefix_embeds, token_emb], dim=0)
+
+                        yield top_ids
+
+                        if finished:
+                            break
+
+                    time.sleep(0.001)
+
+                with self.lock:
+                    self.vllm_output_queue.pop(request_id, None)
+
+        # Final decode: append remaining text and task_id, then generate until EOS
+
+        final_embeds = torch.concat(
+            [prefix_embeds, text_cache_emb.squeeze(0), task_id_emb.squeeze(0)], dim=0
+        )
+
+        # Add last generated token if exists
+        if len(out_tokens) > 0 and out_tokens[-1] < self.speech_token_size:
+            last_speech_emb = self.speech_embedding.weight[out_tokens[-1]].reshape(
+                1, -1
+            )
+            final_embeds = torch.concat([final_embeds, last_speech_emb], dim=0)
+
+        lm_input = final_embeds.unsqueeze(0)
+
+        # Calculate remaining max tokens
+        text_len = prompt_text_len.item() + text_cache_emb.size(1)
+        max_len = int(text_len * max_token_text_ratio) - len(out_tokens)
+        max_len = max(max_len, 100)  # ensure reasonable minimum
+
+        sampling_params = SamplingParams(
+            top_k=sampling,
+            stop_token_ids=self.stop_token_ids,
+            max_tokens=max_len,
+            detokenize=False,
+        )
+
+        request_id = str(uuid_lib.uuid4())
+
+        with self.lock:
+            self.vllm.add_request(
+                request_id,
+                {"prompt_embeds": lm_input.squeeze(0).to(torch.bfloat16)},
+                sampling_params,
+            )
+            self.vllm_output_queue[request_id] = queue.Queue()
+
+        while True:
+            with self.lock:
+                if self.vllm_output_queue[request_id].empty():
+                    request_outputs: List[RequestOutput] = self.vllm.step()
+                    for request_output in request_outputs:
+                        if request_output.request_id in self.vllm_output_queue:
+                            top_ids = list(request_output.outputs[0].token_ids)[-1]
+                            self.vllm_output_queue[request_output.request_id].put(
+                                (top_ids, request_output.finished)
+                            )
+
+            if not self.vllm_output_queue[request_id].empty():
+                top_ids, finished = self.vllm_output_queue[request_id].get()
+
+                if top_ids in self.stop_token_ids:
+                    break
+
+                out_tokens.append(top_ids)
+                yield top_ids
+
+                if finished or len(out_tokens) >= max_len:
+                    break
+
+            time.sleep(0.001)
+
+        with self.lock:
+            self.vllm_output_queue.pop(request_id, None)
+        from vllm import SamplingParams, RequestOutput
+        import uuid as uuid_lib
+
+        device = prompt_text.device
+
+        # 1. prepare input embeddings
+        # CosyVoice3LM uses speech_embedding for sos/task_id, Qwen2LM uses llm_embedding
+        if hasattr(self, "llm_embedding"):
+            sos_emb = self.llm_embedding.weight[self.sos].reshape(1, 1, -1)
+            task_id_emb = self.llm_embedding.weight[self.task_id].reshape(1, 1, -1)
+        else:
+            sos_emb = self.speech_embedding.weight[self.sos].reshape(1, 1, -1)
+            task_id_emb = self.speech_embedding.weight[self.task_id].reshape(1, 1, -1)
+        if prompt_speech_token_len != 0:
+            prompt_speech_token_emb = self.speech_embedding(prompt_speech_token)
+        else:
+            prompt_speech_token_emb = torch.zeros(
+                1, 0, self.llm_input_size, dtype=prompt_text.dtype
+            ).to(device)
+
+        # Initialize accumulated embeddings with sos
+        accumulated_emb = sos_emb.clone()
+
+        # 2. iterate text
+        out_tokens = []
+        text_cache = self.llm.model.model.embed_tokens(prompt_text)
+        next_fill_index = (
+            int(prompt_speech_token.shape[1] / self.mix_ratio[1]) + 1
+        ) * self.mix_ratio[1] - prompt_speech_token.shape[1]
+
+        request_uuid = None
+
+        for this_text in text:
+            text_cache = torch.concat(
+                [text_cache, self.llm.model.model.embed_tokens(this_text)], dim=1
+            )
+
+            # prompt_speech_token_emb not empty, try append to accumulated_emb
+            while prompt_speech_token_emb.size(1) != 0:
+                if text_cache.size(1) >= self.mix_ratio[0]:
+                    lm_input_text = text_cache[:, : self.mix_ratio[0]]
+                    lm_input_speech = prompt_speech_token_emb[:, : self.mix_ratio[1]]
+                    logging.info(
+                        "append {} text token {} speech token".format(
+                            lm_input_text.size(1), lm_input_speech.size(1)
+                        )
+                    )
+                    accumulated_emb = torch.concat(
+                        [accumulated_emb, lm_input_text, lm_input_speech], dim=1
+                    )
+                    text_cache = text_cache[:, self.mix_ratio[0] :]
+                    prompt_speech_token_emb = prompt_speech_token_emb[
+                        :, self.mix_ratio[1] :
+                    ]
+                else:
+                    logging.info("not enough text token to decode, wait for more")
+                    break
+
+            # no prompt_speech_token_emb remain, can decode some speech token
+            if prompt_speech_token_emb.size(1) == 0:
+                if (len(out_tokens) != 0 and out_tokens[-1] == self.fill_token) or (
+                    len(out_tokens) == 0 and accumulated_emb.size(1) == 1
+                ):
+                    logging.info("get fill token, need to append more text token")
+                    if text_cache.size(1) >= self.mix_ratio[0]:
+                        lm_input_text = text_cache[:, : self.mix_ratio[0]]
+                        logging.info(
+                            "append {} text token".format(lm_input_text.size(1))
+                        )
+                        accumulated_emb = torch.concat(
+                            [accumulated_emb, lm_input_text], dim=1
+                        )
+                        text_cache = text_cache[:, self.mix_ratio[0] :]
+                    else:
+                        logging.info("not enough text token to decode, wait for more")
+                        continue
+
+                # Generate speech tokens using VLLM
+                while True:
+                    # Build full prompt: accumulated_emb + generated speech tokens
+                    if len(out_tokens) > 0:
+                        generated_emb = torch.stack(
+                            [self.speech_embedding.weight[t] for t in out_tokens], dim=0
+                        ).unsqueeze(0)
+                        full_prompt_emb = torch.concat(
+                            [accumulated_emb, generated_emb], dim=1
+                        )
+                    else:
+                        full_prompt_emb = accumulated_emb
+
+                    # Create new VLLM request
+                    if request_uuid is not None:
+                        with self.lock:
+                            self.vllm.abort_request(request_uuid)
+                            self.vllm_output_queue.pop(request_uuid, None)
+                            self.vllm_output_event.pop(request_uuid, None)
+
+                    request_uuid = str(uuid_lib.uuid1())
+                    sampling_params = SamplingParams(
+                        top_k=sampling,
+                        stop_token_ids=self.stop_token_ids,
+                        max_tokens=self.mix_ratio[1] + 5,
+                    )
+
+                    with self.lock:
+                        self.vllm.add_request(
+                            request_uuid,
+                            {
+                                "prompt_embeds": full_prompt_emb.squeeze(0)
+                                .to(torch.bfloat16)
+                                .to(device)
+                            },
+                            sampling_params,
+                        )
+                        self.vllm_output_queue[request_uuid] = queue.Queue()
+                        self.vllm_output_event[request_uuid] = threading.Event()
+
+                    # Step VLLM until we get a token
+                    got_token = False
+                    while not got_token:
+                        self.vllm_output_event[request_uuid].wait(timeout=0.01)
+                        self.vllm_output_event[request_uuid].clear()
+
+                        with self.lock:
+                            if self.vllm_output_queue[request_uuid].empty():
+                                request_outputs: List[RequestOutput] = self.vllm.step()
+                                for request_output in request_outputs:
+                                    top_ids = list(request_output.outputs[0].token_ids)[
+                                        -1
+                                    ]
+                                    if (
+                                        request_output.request_id
+                                        in self.vllm_output_queue
+                                    ):
+                                        self.vllm_output_queue[
+                                            request_output.request_id
+                                        ].put(top_ids)
+                                        if (
+                                            request_output.request_id
+                                            in self.vllm_output_event
+                                        ):
+                                            self.vllm_output_event[
+                                                request_output.request_id
+                                            ].set()
+
+                        if not self.vllm_output_queue[request_uuid].empty():
+                            top_ids = self.vllm_output_queue[request_uuid].get()
+
+                            # Force fill_token at expected positions
+                            if (
+                                next_fill_index != -1
+                                and len(out_tokens) == next_fill_index
+                            ):
+                                top_ids = self.fill_token
+                                next_fill_index += self.mix_ratio[1] + 1
+
+                            if top_ids == self.fill_token:
+                                next_fill_index = (
+                                    len(out_tokens) + self.mix_ratio[1] + 1
+                                )
+                                logging.info(
+                                    "fill_token index {} next fill_token index {}".format(
+                                        len(out_tokens), next_fill_index
+                                    )
+                                )
+
+                            out_tokens.append(top_ids)
+                            if top_ids >= self.speech_token_size:
+                                if top_ids == self.fill_token:
+                                    got_token = True  # Break to get more text
+                                else:
+                                    raise ValueError(
+                                        "should not get token {}".format(top_ids)
+                                    )
+                            else:
+                                yield top_ids
+                                got_token = True
+
+                    # Check if we got fill_token - break to get more text
+                    if len(out_tokens) > 0 and out_tokens[-1] == self.fill_token:
+                        break
+
+        # 3. final decode - no more text, decode until eos
+        if request_uuid is not None:
+            with self.lock:
+                self.vllm.abort_request(request_uuid)
+                self.vllm_output_queue.pop(request_uuid, None)
+                self.vllm_output_event.pop(request_uuid, None)
+
+        # Build final prompt with remaining text and task_id
+        if len(out_tokens) > 0:
+            generated_emb = torch.stack(
+                [self.speech_embedding.weight[t] for t in out_tokens], dim=0
+            ).unsqueeze(0)
+            full_prompt_emb = torch.concat(
+                [accumulated_emb, generated_emb, text_cache, task_id_emb], dim=1
+            )
+        else:
+            full_prompt_emb = torch.concat(
+                [accumulated_emb, text_cache, task_id_emb], dim=1
+            )
+
+        request_uuid = str(uuid_lib.uuid1())
+        sampling_params = SamplingParams(
+            top_k=sampling,
+            stop_token_ids=self.stop_token_ids,
+            max_tokens=1000,
+        )
+
+        with self.lock:
+            self.vllm.add_request(
+                request_uuid,
+                {
+                    "prompt_embeds": full_prompt_emb.squeeze(0)
+                    .to(torch.bfloat16)
+                    .to(device)
+                },
+                sampling_params,
+            )
+            self.vllm_output_queue[request_uuid] = queue.Queue()
+            self.vllm_output_event[request_uuid] = threading.Event()
+
+        logging.info("no more text token, decode until met eos")
+        while True:
+            self.vllm_output_event[request_uuid].wait(timeout=0.01)
+            self.vllm_output_event[request_uuid].clear()
+
+            with self.lock:
+                if self.vllm_output_queue[request_uuid].empty():
+                    request_outputs: List[RequestOutput] = self.vllm.step()
+                    for request_output in request_outputs:
+                        top_ids = list(request_output.outputs[0].token_ids)[-1]
+                        if request_output.request_id in self.vllm_output_queue:
+                            self.vllm_output_queue[request_output.request_id].put(
+                                top_ids
+                            )
+                            if request_output.request_id in self.vllm_output_event:
+                                self.vllm_output_event[request_output.request_id].set()
+
+            if not self.vllm_output_queue[request_uuid].empty():
+                top_ids = self.vllm_output_queue[request_uuid].get()
+                out_tokens.append(top_ids)
+                if top_ids >= self.speech_token_size:
+                    if top_ids == self.eos_token:
+                        break
+                    else:
+                        raise ValueError("should not get token {}".format(top_ids))
+                yield top_ids
+
+        with self.lock:
+            self.vllm_output_queue.pop(request_uuid, None)
+            self.vllm_output_event.pop(request_uuid, None)
+
 
 class CosyVoice3LM(Qwen2LM):
     def __init__(
@@ -919,6 +1413,7 @@ class CosyVoice3LM(Qwen2LM):
         # 5. vllm related
         self.stop_token_ids = [speech_token_size + i for i in range(200)]
         self.vllm_output_queue = {}
+        self.vllm_output_event = {}
 
     def forward(
         self,
