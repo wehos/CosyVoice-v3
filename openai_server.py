@@ -7,12 +7,11 @@ import threading
 import subprocess
 import numpy as np
 import json
-import base64
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, Literal
+from typing import Optional, Literal, Generator
 
 # Adjust path to include CosyVoice modules
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -70,14 +69,6 @@ class SpeechRequest(BaseModel):
     speed: Optional[float] = 1.0
 
 
-class RegisterSpeakerRequest(BaseModel):
-    """Request model for registering a new speaker via voice cloning."""
-
-    speaker_id: str  # Unique identifier for the speaker
-    prompt_text: str  # Text content spoken in the prompt audio
-    prompt_wav_base64: str  # Base64-encoded WAV audio of the voice prompt
-
-
 def get_ffmpeg_cmd(format: str, sample_rate: int):
     cmd = ["ffmpeg", "-f", "s16le", "-ar", str(sample_rate), "-ac", "1", "-i", "pipe:0"]
     if format == "mp3":
@@ -107,16 +98,10 @@ async def startup_event():
         else:
             if "CosyVoice2" in MODEL_DIR:
                 cosyvoice = AutoModel(
-                    model_dir=MODEL_DIR,
-                    load_trt=True,
-                    load_jit=True,
-                    fp16=True,
-                    load_vllm=True,
+                    model_dir=MODEL_DIR, load_trt=True, load_jit=True, fp16=True, load_vllm=True
                 )
             else:
-                cosyvoice = AutoModel(
-                    model_dir=MODEL_DIR, load_trt=True, load_vllm=True
-                )
+                cosyvoice = AutoModel(model_dir=MODEL_DIR, load_trt=True, load_vllm=True, fp16=True)
             logger.info(f"Model loaded. Sample rate: {cosyvoice.sample_rate}")
             available_spks = cosyvoice.list_available_spks()
             logger.info(f"Available speakers: {available_spks}")
@@ -179,94 +164,6 @@ async def list_models():
             ],
         }
     )
-
-
-@app.get("/v1/speakers")
-async def list_speakers():
-    """List all available speakers (both built-in and registered via voice cloning)."""
-    if not cosyvoice:
-        raise HTTPException(
-            status_code=500, detail="Model not loaded or invalid model directory."
-        )
-    speakers = cosyvoice.list_available_spks()
-    return JSONResponse(
-        content={
-            "object": "list",
-            "data": [{"id": spk, "object": "speaker"} for spk in speakers],
-        }
-    )
-
-
-@app.post("/v1/speakers/register")
-async def register_speaker(req: RegisterSpeakerRequest):
-    """
-    Register a new speaker via voice cloning.
-
-    This endpoint allows you to clone a voice by providing:
-    - speaker_id: A unique identifier for the speaker
-    - prompt_text: The text content spoken in the audio
-    - prompt_wav_base64: Base64-encoded WAV audio of the voice prompt
-
-    After registration, the speaker_id can be used as the 'voice' parameter in TTS requests.
-    """
-    if not cosyvoice:
-        raise HTTPException(
-            status_code=500, detail="Model not loaded or invalid model directory."
-        )
-
-    speaker_id = req.speaker_id.strip()
-    if not speaker_id:
-        raise HTTPException(status_code=400, detail="speaker_id cannot be empty")
-
-    prompt_text = req.prompt_text
-    if not prompt_text:
-        raise HTTPException(status_code=400, detail="prompt_text cannot be empty")
-
-    # Decode base64 WAV data
-    try:
-        wav_bytes = base64.b64decode(req.prompt_wav_base64)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid base64 encoding: {e}")
-
-    # Save to a temporary file for CosyVoice to process
-    import tempfile
-
-    temp_wav_path = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-            f.write(wav_bytes)
-            temp_wav_path = f.name
-
-        loop = asyncio.get_running_loop()
-
-        def do_register():
-            return cosyvoice.add_zero_shot_spk(prompt_text, temp_wav_path, speaker_id)
-
-        success = await loop.run_in_executor(None, do_register)
-
-        if success:
-            logger.info(f"Successfully registered speaker: {speaker_id}")
-            return JSONResponse(
-                content={
-                    "success": True,
-                    "speaker_id": speaker_id,
-                    "message": f"Speaker '{speaker_id}' registered successfully",
-                }
-            )
-        else:
-            raise HTTPException(status_code=500, detail="Failed to register speaker")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error registering speaker: {e}")
-        raise HTTPException(status_code=500, detail=f"Error registering speaker: {e}")
-    finally:
-        # Clean up temporary file
-        if temp_wav_path and os.path.exists(temp_wav_path):
-            try:
-                os.remove(temp_wav_path)
-            except Exception:
-                pass
 
 
 @app.post("/v1/audio/speech")

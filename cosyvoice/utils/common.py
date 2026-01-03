@@ -146,7 +146,7 @@ def ras_sampling(weighted_scores, decoded_tokens, sampling, top_p=0.8, top_k=25,
 def nucleus_sampling(weighted_scores, top_p=0.8, top_k=25):
     prob, indices = [], []
     cum_prob = 0.0
-    sorted_value, sorted_idx = weighted_scores.softmax(dim=0).sort(descending=True, stable=True)
+    sorted_value, sorted_idx = weighted_scores.softmax(dim=0).detach().sort(descending=True, stable=True)
     for i in range(len(sorted_idx)):
         # sampling both top-p and numbers.
         if cum_prob < top_p and len(prob) < top_k:

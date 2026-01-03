@@ -161,7 +161,9 @@ class CosyVoiceFrontEnd:
 
     def frontend_sft(self, tts_text, spk_id):
         tts_text_token, tts_text_token_len = self._extract_text_token(tts_text)
-        embedding = self.spk2info[spk_id]['embedding']
+        embedding = torch.load('/home/wehos/workspace/CV3/pretrained_models/Fun-CosyVoice3-0.5B/spk2embedding.pt')
+        embedding = torch.tensor(embedding["Paimon_Chinese"])[None]
+        # embedding = self.spk2info[spk_id]['embedding']
         model_input = {'text': tts_text_token, 'text_len': tts_text_token_len, 'llm_embedding': embedding, 'flow_embedding': embedding}
         return model_input
 
