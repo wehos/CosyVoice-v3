@@ -84,7 +84,6 @@ used in this file.
 """
 import argparse
 import time
-import wave
 from pathlib import Path
 from typing import List, Tuple, Dict, Iterable, TextIO, Union
 

@@ -4,7 +4,6 @@ import argparse
 from datasets import load_dataset
 from torch.utils.data import DataLoader
 import numpy as np
-import torchaudio
 import time
 from token2wav_dit import CosyVoice2_Token2Wav
 import soundfile as sf

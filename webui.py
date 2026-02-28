@@ -16,10 +16,8 @@ import sys
 import argparse
 import gradio as gr
 import numpy as np
-import torch
 import torchaudio
 import random
-import librosa
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append('{}/third_party/Matcha-TTS'.format(ROOT_DIR))
 from cosyvoice.cli.cosyvoice import AutoModel

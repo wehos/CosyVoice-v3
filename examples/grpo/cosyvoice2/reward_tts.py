@@ -116,7 +116,6 @@ def compute_score(
 
 # CLI quick test
 if __name__ == "__main__":
-    import sys
 
     def get_args():
         """Parse command line arguments."""

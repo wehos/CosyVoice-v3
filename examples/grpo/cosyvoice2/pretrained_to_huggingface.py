@@ -24,7 +24,7 @@ Usage: Instruct TTS
 from cosyvoice.cli.cosyvoice import CosyVoice2
 import sys
 from argparse import ArgumentParser
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer
 import torch
 
 sys.path.append("/workspace/CosyVoice/third_party/Matcha-TTS")

@@ -30,7 +30,6 @@ from torch.utils.dlpack import to_dlpack
 import triton_python_backend_utils as pb_utils
 
 import os
-import numpy as np
 import torchaudio.compliance.kaldi as kaldi
 from cosyvoice.utils.file_utils import convert_onnx_to_trt
 from cosyvoice.utils.common import TrtContextWrapper

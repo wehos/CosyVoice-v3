@@ -27,20 +27,17 @@ torchrun --nproc_per_node=8 \
 """
 
 import argparse
-import json
 import os
 import sys
-from pathlib import Path
 
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 import torchaudio
 from cosyvoice.cli.cosyvoice import CosyVoice2
 from cosyvoice.utils.file_utils import load_wav
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from torch.utils.data import DataLoader, Dataset, DistributedSampler
+from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 import soundfile as sf
 import s3tokenizer

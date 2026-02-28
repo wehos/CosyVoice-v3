@@ -31,12 +31,11 @@ import sys
 
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 import torchaudio
 from cosyvoice.utils.file_utils import load_wav
 from datasets import load_dataset
 from transformers import AutoTokenizer
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 import soundfile as sf
 import s3tokenizer

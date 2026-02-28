@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, Literal, Generator
+from typing import Optional, Literal
 
 # Adjust path to include CosyVoice modules
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))

@@ -37,7 +37,7 @@ import triton_python_backend_utils as pb_utils
 
 from hyperpyyaml import load_hyperpyyaml
 from cosyvoice.utils.common import fade_in_out
-from cosyvoice.utils.file_utils import convert_onnx_to_trt, export_cosyvoice2_vllm
+from cosyvoice.utils.file_utils import convert_onnx_to_trt
 from cosyvoice.utils.common import TrtContextWrapper
 from collections import defaultdict
 import numpy as np

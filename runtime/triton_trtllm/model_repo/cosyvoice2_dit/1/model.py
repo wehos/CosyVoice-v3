@@ -25,21 +25,18 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import json
-import math
-import os
 import re
 import time
-from typing import Dict, List, Tuple, Optional, Union
+from typing import List, Union
 import asyncio
 import httpx
 
 import numpy as np
 import torch
-from torch.utils.dlpack import from_dlpack, to_dlpack
+from torch.utils.dlpack import to_dlpack
 import triton_python_backend_utils as pb_utils
 from transformers import AutoTokenizer
 
-import torchaudio
 
 
 from matcha.utils.audio import mel_spectrogram

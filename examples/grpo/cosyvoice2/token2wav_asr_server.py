@@ -17,20 +17,17 @@
 from datasets import load_dataset
 from cosyvoice.cli.cosyvoice import CosyVoice2
 from omnisense.models import OmniSenseVoiceSmall
-from pytriton.proxy.types import Request
 from pytriton.triton import Triton, TritonConfig
 from pytriton.model_config import DynamicBatcher, ModelConfig, Tensor
 from pytriton.decorators import batch
 import argparse
-import io
 import logging
-from typing import Any, List
+from typing import List
 import numpy as np
 import torch
 from scipy.signal import resample
 import sys
 import random
-import re
 from jiwer import wer
 from pypinyin import lazy_pinyin, Style
 from tn.chinese.normalizer import Normalizer as ZhNormalizer

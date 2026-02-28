@@ -32,7 +32,7 @@ from uuid import uuid4
 
 import numpy as np
 import torch
-from torch.utils.dlpack import from_dlpack, to_dlpack
+from torch.utils.dlpack import to_dlpack
 import triton_python_backend_utils as pb_utils
 from transformers import AutoTokenizer
 

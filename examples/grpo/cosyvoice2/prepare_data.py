@@ -17,7 +17,6 @@ Preprocess the Text to Speech dataset to parquet format
 
 import argparse
 import os
-import re
 
 import datasets
 
